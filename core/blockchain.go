@@ -10,21 +10,43 @@ type Blockchain struct {
 	blocks          []Block
 	mu              sync.Mutex
 	transactionPool *TransactionPool
+	storage         *Storage
 }
 
 // NewBlockchain은 제네시스 블록이 포함된 새 체인을 생성합니다.
-func NewBlockchain() *Blockchain {
-	genesis := Block{
-		Index:        0,
-		Timestamp:    "2025-06-10T00:00:00Z",
-		Transactions: []Transaction{},
-		PrevHash:     "",
+func NewBlockchain(host string) *Blockchain {
+	storage, err := NewStorage("data", host)
+	if err != nil {
+		log.Fatalf("스토리지 초기화 실패: %v", err)
 	}
-	genesis.Hash = CalculateHash(genesis)
+
+	// 저장된 블록이 있으면 로드
+	blocks, err := storage.LoadBlocks()
+	if err != nil {
+		log.Fatalf("블록 로드 실패: %v", err)
+	}
+
+	// 저장된 블록이 없으면 제네시스 블록 생성
+	if len(blocks) == 0 {
+		genesis := Block{
+			Index:        0,
+			Timestamp:    "2025-06-10T00:00:00Z",
+			Transactions: []Transaction{},
+			PrevHash:     "",
+		}
+		genesis.Hash = CalculateHash(genesis)
+		blocks = []Block{genesis}
+
+		// 제네시스 블록 저장
+		if err := storage.SaveBlocks(blocks); err != nil {
+			log.Fatalf("제네시스 블록 저장 실패: %v", err)
+		}
+	}
 
 	return &Blockchain{
-		blocks:          []Block{genesis},
+		blocks:          blocks,
 		transactionPool: NewTransactionPool(),
+		storage:         storage,
 	}
 }
 
@@ -44,6 +66,12 @@ func (bc *Blockchain) AddBlock(transactions []Transaction) Block {
 	lastBlock := bc.blocks[len(bc.blocks)-1]
 	newBlock := GenerateBlock(lastBlock, transactions)
 	bc.blocks = append(bc.blocks, newBlock)
+
+	// 블록 저장
+	if err := bc.storage.SaveBlocks(bc.blocks); err != nil {
+		log.Printf("블록 저장 실패: %v", err)
+	}
+
 	return newBlock
 }
 
@@ -65,6 +93,12 @@ func (bc *Blockchain) MineBlock() Block {
 
 	bc.blocks = append(bc.blocks, newBlock)
 	bc.transactionPool.Clear()
+
+	// 블록 저장
+	if err := bc.storage.SaveBlocks(bc.blocks); err != nil {
+		log.Printf("블록 저장 실패: %v", err)
+	}
+
 	return newBlock
 }
 
@@ -118,6 +152,12 @@ func (bc *Blockchain) AppendBlock(newBlock Block) bool {
 	}
 	bc.blocks = append(bc.blocks, newBlock)
 	bc.transactionPool.Clear()
+
+	// 블록 저장
+	if err := bc.storage.SaveBlocks(bc.blocks); err != nil {
+		log.Printf("블록 저장 실패: %v", err)
+	}
+
 	log.Println("새 블록 추가 성공")
 	return true
 }
@@ -155,5 +195,11 @@ func (bc *Blockchain) ReplaceChain(newBlocks []Block) bool {
 	}
 	bc.blocks = newBlocks
 	bc.transactionPool.Clear() // 체인 교체 시 트랜잭션 풀 비우기
+
+	// 블록 저장
+	if err := bc.storage.SaveBlocks(bc.blocks); err != nil {
+		log.Printf("블록 저장 실패: %v", err)
+	}
+
 	return true
 }
