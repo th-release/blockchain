@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"cth-core.xyz/blockchain/core"
 	"cth-core.xyz/blockchain/message"
 	"cth-core.xyz/blockchain/pbft"
+	util "cth-core.xyz/blockchain/util"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -84,21 +86,24 @@ func (s *P2PServer) HandleConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	remoteAddr := conn.RemoteAddr().String()
+	remoteAddr := util.NormalizeAddr(conn.RemoteAddr().String())
 
 	s.peersMutex.Lock()
 
-	isReconnecting := s.reconnecting[remoteAddr]
-	if !isReconnecting && s.maxPeer < len(s.peers)+1 {
+	if s.maxPeer < len(s.peers)+1 {
 		s.peersMutex.Unlock()
 		log.Println("Peer 최대 연결 갯수 한도초과로 연결 실패:", remoteAddr)
-		conn.Close()
+		closeMessage := websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Maximum peer connection limit exceeded")
+		if err := conn.WriteControl(websocket.CloseMessage, closeMessage, time.Now().Add(time.Second)); err != nil {
+			log.Printf("종료 메시지 전송 실패 (%s): %v", remoteAddr, err)
+		}
+		if err := conn.Close(); err != nil {
+			log.Printf("WebSocket 연결 종료 실패 (%s): %v", remoteAddr, err)
+		}
 		return
 	}
 	s.peers[remoteAddr] = conn
 	s.peersMutex.Unlock()
-
-	log.Println("새 피어 연결:", remoteAddr)
 
 	// 연결되면 최신 블록 요청
 	s.sendMessage(conn, message.Message{Type: message.QUERY_LATEST})
@@ -108,8 +113,6 @@ func (s *P2PServer) HandleConnections(w http.ResponseWriter, r *http.Request) {
 		Type: message.AddNodeId,
 		Data: mustMarshal(s.nodeID),
 	})
-
-	log.Println(s.GetPeers())
 
 	s.sendMessage(conn, message.Message{
 		Type: message.AddPeers,
@@ -133,29 +136,83 @@ func (s *P2PServer) AddNodeId(id string) {
 	}
 }
 
+func (s *P2PServer) onClose(conn *websocket.Conn, remoteAddr string, closeErr error) {
+	// remoteAddr 정규화
+	normalizedAddr := util.NormalizeAddr(remoteAddr)
+
+	// 동시성 안전성을 위해 peersMutex 사용
+	s.peersMutex.Lock()
+	// 디버깅: 삭제 전 peers 맵 상태 출력
+	log.Printf("삭제 전 peers 맵: %+v", s.peers)
+	// normalizedAddr가 맵에 존재하는지 확인
+	if _, exists := s.peers[normalizedAddr]; exists {
+		delete(s.peers, normalizedAddr)
+		log.Printf("피어 삭제 성공: %s", normalizedAddr)
+	} else {
+		log.Printf("피어 삭제 실패: %s는 peers 맵에 존재하지 않음", normalizedAddr)
+	}
+	s.peersMutex.Unlock()
+
+	// 연결 종료 이유 로깅
+	errMessage := ""
+	closeReason := "정상 종료"
+	if closeErr != nil {
+		errMessage = closeErr.Error()
+		if wsErr, ok := closeErr.(*websocket.CloseError); ok {
+			closeReason = fmt.Sprintf("WebSocket 종료 코드: %d, 이유: %s", wsErr.Code, wsErr.Text)
+		} else {
+			closeReason = fmt.Sprintf("비정상 종료: %v", closeErr)
+		}
+		log.Printf("에러 메시지 출력: %s", errMessage)
+	}
+
+	// 연결이 이미 닫혔는지 확인하고 닫기
+	if util.IsConnectionAlive(conn) {
+		if err := conn.Close(); err != nil {
+			log.Printf("WebSocket 연결 종료 실패: %v", err)
+		}
+	} else {
+		log.Printf("연결 이미 닫힘: %s", normalizedAddr)
+	}
+
+	// 최종 피어 목록 로깅
+	log.Printf("피어 연결 종료: %s, 종료 이유: %s, 현재 피어 목록: %+v", normalizedAddr, closeReason, s.GetPeers())
+	log.Printf("========================= errMessage: %s", errMessage)
+	log.Printf("========================= connection reset by peer: %v", strings.Contains(errMessage, "read: connection reset by peer"))
+	log.Printf("========================= use of closed network connection: %v", strings.Contains(errMessage, "use of closed network connection"))
+
+	// 비정상 종료가 아닌 경우에만 재접속 시도
+	if !strings.Contains(errMessage, "read: connection reset by peer") &&
+		!strings.Contains(errMessage, "use of closed network connection") &&
+		!strings.Contains(errMessage, "Maximum peer connection limit exceeded") &&
+		!util.IsConnectionAlive(conn) &&
+		errMessage != "" {
+		log.Printf("연결 종료 후 재접속 대기 시작: %s", normalizedAddr)
+		s.tryReconnect(normalizedAddr)
+	} else {
+		log.Printf("비정상 종료로 인해 재접속 스킵: %s", normalizedAddr)
+	}
+}
+
 func (s *P2PServer) handleMessages(conn *websocket.Conn) {
 	remoteAddr := conn.RemoteAddr().String()
 	defer func() {
-		s.peersMutex.Lock()
-		delete(s.peers, remoteAddr)
-		s.peersMutex.Unlock()
-		conn.Close()
-		log.Printf("피어 연결 종료: %s, 현재 피어 목록: %+v", remoteAddr, s.GetPeers())
-
-		// 재접속 시도 시작 (지연 추가)
-		go func() {
-			log.Printf("연결 종료 후 재접속 대기 시작: %s", remoteAddr)
-			time.Sleep(4 * time.Second) // 중첩 호출 방지를 위해 지연 시간 증가
-			s.tryReconnect(remoteAddr)
-		}()
+		// defer에서 에러를 전달하기 위해 recover 또는 외부 에러 사용
+		s.onClose(conn, remoteAddr, nil)
 	}()
 
 	for {
 		var msg message.Message
 		err := conn.ReadJSON(&msg)
 		if err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket 연결 종료 감지: %s, 에러: %v", remoteAddr, err)
+				s.onClose(conn, remoteAddr, err)
+				return
+			}
 			log.Println("메시지 수신 오류:", err)
-			break
+			s.onClose(conn, remoteAddr, err)
+			return
 		}
 
 		switch msg.Type {
@@ -318,20 +375,17 @@ func (s *P2PServer) BroadcastNewBlock(block core.Block) {
 func (s *P2PServer) ConnectToPeer(address string) error {
 	s.peersMutex.Lock()
 	// 이미 연결된 피어인지 확인
-	if _, ok := s.peers[address]; ok {
+	normalizedAddr := util.NormalizeAddr(address)
+	if _, ok := s.peers[normalizedAddr]; ok {
 		s.peersMutex.Unlock()
-		log.Printf("이미 연결된 피어: %s", address)
+		log.Printf("이미 연결된 피어: %s", normalizedAddr)
 		return nil
 	}
-	// 재접속 시도 중인지 확인
-	if s.reconnecting[address] {
-		s.peersMutex.Unlock()
-		log.Printf("재접속 시도 중인 피어, 연결 스킵: %s, reconnecting 맵: %+v", address, s.reconnecting)
-		return fmt.Errorf("peer is already reconnecting: %s", address)
-	}
+
 	// 연결 시도 중임을 표시
-	s.reconnecting[address] = true
-	log.Printf("연결 시도 시작: %s, reconnecting 맵: %+v", address, s.reconnecting)
+	s.reconnecting[normalizedAddr] = true
+	log.Printf("연결 시도 시작: %s, reconnecting 맵: %+v", normalizedAddr, s.reconnecting)
+
 	s.peersMutex.Unlock()
 
 	// 연결 시도 완료 후 reconnecting 상태 정리
@@ -384,57 +438,48 @@ func (s *P2PServer) GetPeers() []string {
 }
 
 func (s *P2PServer) tryReconnect(address string) {
+	normalizedAddr := util.NormalizeAddr(address)
+
 	s.peersMutex.Lock()
-	// 이미 재접속 시도 중인지 확인
-	if s.reconnecting[address] {
+	if s.reconnecting[normalizedAddr] {
 		s.peersMutex.Unlock()
-		log.Printf("이미 재접속 시도 중, 재접속 스킵: %s, reconnecting 맵: %+v", address, s.reconnecting)
+		log.Printf("이미 재접속 시도 중, 재접속 스킵: %s, reconnecting 맵: %+v", normalizedAddr, s.reconnecting)
 		return
 	}
-	// 재접속 시도 중임을 표시
-	s.reconnecting[address] = true
-	log.Printf("재접속 시도 시작: %s, reconnecting 맵: %+v", address, s.reconnecting)
+	s.reconnecting[normalizedAddr] = true
+	log.Printf("재접속 시도 시작: %s, reconnecting 맵: %+v", normalizedAddr, s.reconnecting)
 	s.peersMutex.Unlock()
 
-	// 재접속 시도 완료 후 상태 정리
 	defer func() {
 		s.peersMutex.Lock()
-		delete(s.reconnecting, address)
+		delete(s.reconnecting, normalizedAddr)
 		s.peersMutex.Unlock()
-		log.Printf("재접속 시도 종료, reconnecting 상태 해제: %s, reconnecting 맵: %+v", address, s.reconnecting)
+		log.Printf("재접속 시도 종료, reconnecting 상태 해제: %s, reconnecting 맵: %+v", normalizedAddr, s.reconnecting)
 	}()
 
-	// 재접속 시도 전 대기
-	log.Printf("재접속 시도 전 대기: %s", address)
-	time.Sleep(5 * time.Second) // 지연 시간 5초로 증가
+	log.Printf("재접속 시도 전 대기: %s", normalizedAddr)
+	time.Sleep(1 * time.Second)
 
 	for attempt := 1; attempt <= 5; attempt++ {
-		// 이미 연결된 경우 재접속 중단
 		s.peersMutex.Lock()
-		if _, ok := s.peers[address]; ok {
+		if _, ok := s.peers[normalizedAddr]; ok {
 			s.peersMutex.Unlock()
-			log.Printf("재접속 시도 중 연결 확인, 재접속 종료: %s", address)
+			log.Printf("재접속 시도 중 연결 확인, 재접속 종료: %s", normalizedAddr)
 			return
 		}
 		s.peersMutex.Unlock()
 
-		log.Printf("재접속 시도 %d/%d: %s", attempt, 5, address)
-		err := s.ConnectToPeer(address)
+		log.Printf("재접속 시도 %d/%d: %s", attempt, 5, normalizedAddr)
+		err := s.ConnectToPeer(address) // 원본 address 사용 (URL에 필요)
 		if err == nil {
-			log.Printf("피어 재접속 성공: %s", address)
+			log.Printf("피어 재접속 성공: %s", normalizedAddr)
 			return
 		}
-		if err.Error() == fmt.Sprintf("peer is already reconnecting: %s", address) {
-			log.Printf("재접속 시도 중복 감지, 종료: %s", address)
-			return
-		}
-
-		// 지수 백오프 적용 (2s, 4s, 8s, 16s, 32s)
 		backoff := time.Duration(2<<uint(attempt-1)) * time.Second
-		log.Printf("재접속 실패 (%s), %d초 후 재시도: %v", address, backoff/time.Second, err)
+		log.Printf("재접속 실패 (%s), %d초 후 재시도: %v", normalizedAddr, backoff/time.Second, err)
 		time.Sleep(backoff)
 	}
-	log.Printf("재접속 최대 시도 횟수 초과, 종료: %s", address)
+	log.Printf("재접속 최대 시도 횟수 초과, 종료: %s", normalizedAddr)
 }
 
 func (s *P2PServer) BroadcastTransaction(tx core.Transaction) {
