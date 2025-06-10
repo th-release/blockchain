@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strings"
 
 	"cth-core.xyz/blockchain/api"
 	"cth-core.xyz/blockchain/core"
@@ -35,7 +34,6 @@ func main() {
 	url := flag.String("url", "", "도메인 또는 IP 주소 (기본값: 로컬 IP)")
 	apiPort := flag.Int("api-port", 8888, "API 서버 포트")
 	p2pPort := flag.Int("p2p-port", 9999, "P2P 서버 포트")
-	peers := flag.String("peers", "", "쉼표(,)로 구분된 초기 피어 주소 목록 (예: localhost:9999,localhost:7777)")
 
 	flag.Parse()
 
@@ -48,15 +46,6 @@ func main() {
 	fmt.Printf("API 포트: %d | P2P 포트: %d | 호스트: %s\n", *apiPort, *p2pPort, host)
 	bc := core.NewBlockchain()
 	p2pserver := network.NewP2PServer(bc, *maxPeer)
-
-	// 초기 피어 연결 시도
-	if *peers != "" {
-		peerList := strings.Split(*peers, ",")
-
-		for _, addr := range peerList {
-			go p2pserver.ConnectToPeer(addr)
-		}
-	}
 
 	server := api.NewServer(p2pserver, bc)
 
