@@ -17,25 +17,16 @@ import (
 )
 
 type P2PServer struct {
-	bc             *core.Blockchain
-	upgrader       websocket.Upgrader
-	peers          map[string]*websocket.Conn
-	peersMutex     sync.RWMutex
-	reconnectState map[string]*ReconnectState // 재접속 상태 관리
-	nodeID         string                     // 현재 노드의 ID
-	nodeIDs        []string                   // 전체 네트워크 노드 ID
-	pbftEngine     *pbft.PBFT                 // 포인터로 선언
-	mutex          sync.Mutex
-	maxPeer        int
-}
-
-// 재접속 상태 구조체
-type ReconnectState struct {
-	isReconnecting bool
-	lastAttempt    time.Time
-	attemptCount   int
-	maxAttempts    int
-	mutex          sync.Mutex
+	bc           *core.Blockchain
+	upgrader     websocket.Upgrader
+	peers        map[string]*websocket.Conn
+	peersMutex   sync.Mutex
+	reconnecting map[string]bool // 재접속 시도 중인 주소 기록
+	nodeID       string          // 현재 노드의 ID
+	nodeIDs      []string        // 전체 네트워크 노드 ID
+	pbftEngine   *pbft.PBFT      // 포인터로 선언
+	mutex        sync.Mutex
+	maxPeer      int
 }
 
 func (s *P2PServer) Info() *pbft.PBFT {
@@ -50,13 +41,13 @@ func NewP2PServer(bc *core.Blockchain, maxPeer int) *P2PServer {
 	}
 
 	s := &P2PServer{
-		bc:             bc,
-		upgrader:       websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
-		peers:          make(map[string]*websocket.Conn),
-		reconnectState: make(map[string]*ReconnectState),
-		nodeID:         nodeID.String(),
-		nodeIDs:        []string{nodeID.String()}, // 처음엔 자기 자신만 포함
-		maxPeer:        maxPeer,
+		bc:           bc,
+		upgrader:     websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
+		peers:        make(map[string]*websocket.Conn),
+		reconnecting: make(map[string]bool),
+		nodeID:       nodeID.String(),
+		nodeIDs:      []string{nodeID.String()}, // 처음엔 자기 자신만 포함
+		maxPeer:      maxPeer,
 	}
 
 	// pbftEngine 초기화
@@ -97,24 +88,14 @@ func (s *P2PServer) HandleConnections(w http.ResponseWriter, r *http.Request) {
 
 	s.peersMutex.Lock()
 
-	// 최대 피어 수 체크
-	if len(s.peers) >= s.maxPeer {
+	isReconnecting := s.reconnecting[remoteAddr]
+	if !isReconnecting && s.maxPeer < len(s.peers)+1 {
 		s.peersMutex.Unlock()
 		log.Println("Peer 최대 연결 갯수 한도초과로 연결 실패:", remoteAddr)
 		conn.Close()
 		return
 	}
-
 	s.peers[remoteAddr] = conn
-
-	// 재접속 상태 초기화 (성공적으로 연결됨)
-	if state, exists := s.reconnectState[remoteAddr]; exists {
-		state.mutex.Lock()
-		state.isReconnecting = false
-		state.attemptCount = 0
-		state.mutex.Unlock()
-	}
-
 	s.peersMutex.Unlock()
 
 	log.Println("새 피어 연결:", remoteAddr)
@@ -152,20 +133,6 @@ func (s *P2PServer) AddNodeId(id string) {
 	}
 }
 
-func (s *P2PServer) clearReconnectState(address string) {
-	s.peersMutex.Lock()
-	defer s.peersMutex.Unlock()
-
-	if state, exists := s.reconnectState[address]; exists {
-		state.mutex.Lock()
-		state.isReconnecting = false
-		state.attemptCount = 0
-		state.lastAttempt = time.Time{}
-		state.mutex.Unlock()
-		log.Printf("reconnectingState 정리됨: %s", address)
-	}
-}
-
 func (s *P2PServer) handleMessages(conn *websocket.Conn) {
 	remoteAddr := conn.RemoteAddr().String()
 	defer func() {
@@ -175,11 +142,12 @@ func (s *P2PServer) handleMessages(conn *websocket.Conn) {
 		conn.Close()
 		log.Printf("피어 연결 종료: %s, 현재 피어 목록: %+v", remoteAddr, s.GetPeers())
 
-		// 메시지 처리가 완전히 끝났으므로 reconnectingState 정리
-		s.clearReconnectState(remoteAddr)
-
-		// 재접속 시도 (백그라운드에서)
-		go s.scheduleReconnect(remoteAddr)
+		// 재접속 시도 시작 (지연 추가)
+		go func() {
+			log.Printf("연결 종료 후 재접속 대기 시작: %s", remoteAddr)
+			time.Sleep(4 * time.Second) // 중첩 호출 방지를 위해 지연 시간 증가
+			s.tryReconnect(remoteAddr)
+		}()
 	}()
 
 	for {
@@ -265,6 +233,7 @@ func (s *P2PServer) handleMessages(conn *websocket.Conn) {
 				}
 			}
 		}
+
 	}
 }
 
@@ -309,8 +278,8 @@ func (s *P2PServer) sendMessage(conn *websocket.Conn, msg message.Message) error
 }
 
 func (s *P2PServer) Broadcast(msg message.Message) {
-	s.peersMutex.RLock()
-	defer s.peersMutex.RUnlock()
+	s.peersMutex.Lock()
+	defer s.peersMutex.Unlock()
 	for _, peer := range s.peers {
 		fmt.Printf("전파! %s\n", msg.Data)
 		peer.WriteJSON(msg)
@@ -323,12 +292,27 @@ func (s *P2PServer) broadcastMessage(msg message.Message) {
 
 // 피어에 새 블록 전파
 func (s *P2PServer) BroadcastNewBlock(block core.Block) {
+	// blocks := []core.Block{block}
+	// data, err := json.Marshal(blocks)
+	// if err != nil {
+	// 	fmt.Println("broadcast jasn parsing error")
+	// 	// 에러 처리: 로그 출력 등
+	// 	return
+	// }
+
 	if s.pbftEngine.IsLeader() {
 		fmt.Println("전파 로직 수행")
+
+		// s.Broadcast(Message{
+		// 	Type: message.RESPONSE_BLOCKCHAIN,
+		// 	Data: data,
+		// })
+
 		s.pbftEngine.Broadcast(message.MessageTypePBFTPrePrepare, block)
 	} else {
 		log.Println("리더 노드가 아니므로 블록 생성 생략")
 	}
+
 }
 
 func (s *P2PServer) ConnectToPeer(address string) error {
@@ -339,28 +323,39 @@ func (s *P2PServer) ConnectToPeer(address string) error {
 		log.Printf("이미 연결된 피어: %s", address)
 		return nil
 	}
+	// 재접속 시도 중인지 확인
+	if s.reconnecting[address] {
+		s.peersMutex.Unlock()
+		log.Printf("재접속 시도 중인 피어, 연결 스킵: %s, reconnecting 맵: %+v", address, s.reconnecting)
+		return fmt.Errorf("peer is already reconnecting: %s", address)
+	}
+	// 연결 시도 중임을 표시
+	s.reconnecting[address] = true
+	log.Printf("연결 시도 시작: %s, reconnecting 맵: %+v", address, s.reconnecting)
 	s.peersMutex.Unlock()
 
-	// 재접속 상태 확인
-	if !s.canAttemptConnection(address) {
-		return fmt.Errorf("connection attempt blocked for %s", address)
-	}
+	// 연결 시도 완료 후 reconnecting 상태 정리
+	defer func() {
+		s.peersMutex.Lock()
+		delete(s.reconnecting, address)
+		s.peersMutex.Unlock()
+		log.Printf("연결 시도 완료, reconnecting 상태 해제: %s, reconnecting 맵: %+v", address, s.reconnecting)
+	}()
 
 	// 최대 피어 수 초과 체크
-	s.peersMutex.RLock()
+	s.peersMutex.Lock()
 	if len(s.peers) >= s.maxPeer {
-		s.peersMutex.RUnlock()
+		s.peersMutex.Unlock()
 		log.Printf("최대 피어 수 초과로 연결 실패: %s", address)
 		return fmt.Errorf("maximum peer limit reached")
 	}
-	s.peersMutex.RUnlock()
+	s.peersMutex.Unlock()
 
 	url := "ws://" + address + "/ws"
 	log.Printf("WebSocket 연결 시도: %s", url)
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
 		log.Printf("피어 연결 실패 (%s): %v", address, err)
-		s.markConnectionFailure(address)
 		return err
 	}
 
@@ -377,76 +372,9 @@ func (s *P2PServer) ConnectToPeer(address string) error {
 	return nil
 }
 
-// 연결 시도 가능 여부 확인
-func (s *P2PServer) canAttemptConnection(address string) bool {
-	s.peersMutex.Lock()
-	defer s.peersMutex.Unlock()
-
-	state, exists := s.reconnectState[address]
-	if !exists {
-		s.reconnectState[address] = &ReconnectState{
-			isReconnecting: false,
-			maxAttempts:    5,
-		}
-		return true
-	}
-
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
-
-	// 이미 재접속 시도 중이면 차단
-	if state.isReconnecting {
-		log.Printf("재접속 시도 중인 피어, 연결 스킵: %s", address)
-		return false
-	}
-
-	// 최대 시도 횟수 초과 체크
-	if state.attemptCount >= state.maxAttempts {
-		// 마지막 시도로부터 10분이 지났다면 초기화
-		if time.Since(state.lastAttempt) > 10*time.Minute {
-			state.attemptCount = 0
-			log.Printf("재접속 제한 시간 만료, 시도 횟수 초기화: %s", address)
-		} else {
-			log.Printf("최대 재접속 시도 횟수 초과: %s", address)
-			return false
-		}
-	}
-
-	state.isReconnecting = true
-	return true
-}
-
-// 연결 실패 표시
-func (s *P2PServer) markConnectionFailure(address string) {
-	s.peersMutex.Lock()
-	defer s.peersMutex.Unlock()
-
-	if state, exists := s.reconnectState[address]; exists {
-		state.mutex.Lock()
-		state.isReconnecting = false
-		state.attemptCount++
-		state.lastAttempt = time.Now()
-		state.mutex.Unlock()
-	}
-}
-
-// 연결 성공 표시
-func (s *P2PServer) markConnectionSuccess(address string) {
-	s.peersMutex.Lock()
-	defer s.peersMutex.Unlock()
-
-	if state, exists := s.reconnectState[address]; exists {
-		state.mutex.Lock()
-		state.isReconnecting = false
-		state.attemptCount = 0
-		state.lastAttempt = time.Time{}
-		state.mutex.Unlock()
-	}
-}
-
 func (s *P2PServer) GetPeers() []string {
-	s.peersMutex.RLock()
-	defer s.peersMutex.RUnlock()
+	s.peersMutex.Lock()
+	defer s.peersMutex.Unlock()
 
 	peers := make([]string, 0, len(s.peers))
 	for addr := range s.peers {
@@ -455,39 +383,57 @@ func (s *P2PServer) GetPeers() []string {
 	return peers
 }
 
-// 재접속 스케줄링 (단순화된 버전)
-func (s *P2PServer) scheduleReconnect(address string) {
-	// 초기 대기 시간
-	time.Sleep(5 * time.Second)
+func (s *P2PServer) tryReconnect(address string) {
+	s.peersMutex.Lock()
+	// 이미 재접속 시도 중인지 확인
+	if s.reconnecting[address] {
+		s.peersMutex.Unlock()
+		log.Printf("이미 재접속 시도 중, 재접속 스킵: %s, reconnecting 맵: %+v", address, s.reconnecting)
+		return
+	}
+	// 재접속 시도 중임을 표시
+	s.reconnecting[address] = true
+	log.Printf("재접속 시도 시작: %s, reconnecting 맵: %+v", address, s.reconnecting)
+	s.peersMutex.Unlock()
+
+	// 재접속 시도 완료 후 상태 정리
+	defer func() {
+		s.peersMutex.Lock()
+		delete(s.reconnecting, address)
+		s.peersMutex.Unlock()
+		log.Printf("재접속 시도 종료, reconnecting 상태 해제: %s, reconnecting 맵: %+v", address, s.reconnecting)
+	}()
+
+	// 재접속 시도 전 대기
+	log.Printf("재접속 시도 전 대기: %s", address)
+	time.Sleep(5 * time.Second) // 지연 시간 5초로 증가
 
 	for attempt := 1; attempt <= 5; attempt++ {
-		// 이미 연결된 경우 중단
-		s.peersMutex.RLock()
-		if _, connected := s.peers[address]; connected {
-			s.peersMutex.RUnlock()
-			log.Printf("재접속 시도 중 연결 확인됨, 중단: %s", address)
+		// 이미 연결된 경우 재접속 중단
+		s.peersMutex.Lock()
+		if _, ok := s.peers[address]; ok {
+			s.peersMutex.Unlock()
+			log.Printf("재접속 시도 중 연결 확인, 재접속 종료: %s", address)
 			return
 		}
-		s.peersMutex.RUnlock()
+		s.peersMutex.Unlock()
 
 		log.Printf("재접속 시도 %d/%d: %s", attempt, 5, address)
-
 		err := s.ConnectToPeer(address)
 		if err == nil {
 			log.Printf("피어 재접속 성공: %s", address)
 			return
 		}
-
-		// 지수 백오프 적용
-		backoff := time.Duration(5<<uint(attempt-1)) * time.Second
-		if backoff > 10*time.Second {
-			backoff = 10 * time.Second
+		if err.Error() == fmt.Sprintf("peer is already reconnecting: %s", address) {
+			log.Printf("재접속 시도 중복 감지, 종료: %s", address)
+			return
 		}
 
+		// 지수 백오프 적용 (2s, 4s, 8s, 16s, 32s)
+		backoff := time.Duration(2<<uint(attempt-1)) * time.Second
 		log.Printf("재접속 실패 (%s), %d초 후 재시도: %v", address, backoff/time.Second, err)
 		time.Sleep(backoff)
 	}
-
 	log.Printf("재접속 최대 시도 횟수 초과, 종료: %s", address)
 }
 
@@ -497,8 +443,8 @@ func (s *P2PServer) BroadcastTransaction(tx core.Transaction) {
 		Data: mustMarshal(tx),
 	}
 
-	s.peersMutex.RLock()
-	defer s.peersMutex.RUnlock()
+	s.peersMutex.Lock()
+	defer s.peersMutex.Unlock()
 
 	for _, peer := range s.peers {
 		if err := peer.WriteJSON(msg); err != nil {
