@@ -65,13 +65,17 @@ func (bc *Blockchain) AddBlock(transactions []Transaction) Block {
 
 	lastBlock := bc.blocks[len(bc.blocks)-1]
 	newBlock := GenerateBlock(lastBlock, transactions)
-	bc.blocks = append(bc.blocks, newBlock)
 
-	// 블록 저장
+	// 블록 추가 전에 저장 시도
+	bc.blocks = append(bc.blocks, newBlock)
 	if err := bc.storage.SaveBlocks(bc.blocks); err != nil {
-		log.Printf("블록 저장 실패: %v", err)
+		// 저장 실패 시 블록 제거
+		bc.blocks = bc.blocks[:len(bc.blocks)-1]
+		log.Printf("블록 저장 실패로 추가 취소: %v", err)
+		return Block{}
 	}
 
+	log.Printf("새 블록 추가 성공: 인덱스=%d, 해시=%s", newBlock.Index, newBlock.Hash)
 	return newBlock
 }
 
@@ -81,6 +85,7 @@ func (bc *Blockchain) MineBlock() Block {
 
 	transactions := bc.transactionPool.GetTransactions()
 	if len(transactions) == 0 {
+		log.Println("마이닝 실패: 트랜잭션이 없음")
 		return Block{}
 	}
 
@@ -88,17 +93,21 @@ func (bc *Blockchain) MineBlock() Block {
 	newBlock := GenerateBlock(lastBlock, transactions)
 
 	if CalculateHash(newBlock) != newBlock.Hash {
+		log.Printf("마이닝 실패: 해시 불일치. 계산된: %s, 생성된: %s", CalculateHash(newBlock), newBlock.Hash)
 		return Block{}
 	}
 
+	// 블록 추가 전에 저장 시도
 	bc.blocks = append(bc.blocks, newBlock)
-	bc.transactionPool.Clear()
-
-	// 블록 저장
 	if err := bc.storage.SaveBlocks(bc.blocks); err != nil {
-		log.Printf("블록 저장 실패: %v", err)
+		// 저장 실패 시 블록 제거
+		bc.blocks = bc.blocks[:len(bc.blocks)-1]
+		log.Printf("블록 저장 실패로 마이닝 취소: %v", err)
+		return Block{}
 	}
 
+	bc.transactionPool.Clear()
+	log.Printf("블록 마이닝 성공: 인덱스=%d, 해시=%s", newBlock.Index, newBlock.Hash)
 	return newBlock
 }
 
@@ -143,22 +152,25 @@ func (bc *Blockchain) AppendBlock(newBlock Block) bool {
 
 	lastBlock := bc.blocks[len(bc.blocks)-1]
 	if lastBlock.Hash != newBlock.PrevHash {
-		log.Printf("Append 실패: 마지막 해시 %s != 새 블록 이전 해시 %s\n", lastBlock.Hash, newBlock.PrevHash)
+		log.Printf("[AppendBlock] 실패: 마지막 블록 해시(%s) != 새 블록 이전 해시(%s)", lastBlock.Hash, newBlock.PrevHash)
 		return false
 	}
 	if CalculateHash(newBlock) != newBlock.Hash {
-		log.Printf("Append 실패: 해시 불일치. 계산된: %s, 받은: %s\n", CalculateHash(newBlock), newBlock.Hash)
+		log.Printf("[AppendBlock] 실패: 해시 불일치. 계산된: %s, 실제: %s", CalculateHash(newBlock), newBlock.Hash)
 		return false
 	}
-	bc.blocks = append(bc.blocks, newBlock)
-	bc.transactionPool.Clear()
 
-	// 블록 저장
+	// 블록 추가 전에 저장 시도
+	bc.blocks = append(bc.blocks, newBlock)
 	if err := bc.storage.SaveBlocks(bc.blocks); err != nil {
-		log.Printf("블록 저장 실패: %v", err)
+		// 저장 실패 시 블록 제거
+		bc.blocks = bc.blocks[:len(bc.blocks)-1]
+		log.Printf("블록 저장 실패로 추가 취소: %v", err)
+		return false
 	}
 
-	log.Println("새 블록 추가 성공")
+	bc.transactionPool.Clear()
+	log.Printf("새 블록 추가 성공: 인덱스=%d, 해시=%s", newBlock.Index, newBlock.Hash)
 	return true
 }
 
@@ -188,18 +200,25 @@ func (bc *Blockchain) ReplaceChain(newBlocks []Block) bool {
 	defer bc.mu.Unlock()
 
 	if len(newBlocks) <= len(bc.blocks) {
+		log.Printf("체인 교체 실패: 새 체인 길이(%d) <= 현재 체인 길이(%d)", len(newBlocks), len(bc.blocks))
 		return false
 	}
 	if !isValidChain(newBlocks) {
+		log.Printf("체인 교체 실패: 유효하지 않은 체인")
 		return false
 	}
-	bc.blocks = newBlocks
-	bc.transactionPool.Clear() // 체인 교체 시 트랜잭션 풀 비우기
 
-	// 블록 저장
+	// 체인 교체 전에 저장 시도
+	oldBlocks := bc.blocks
+	bc.blocks = newBlocks
 	if err := bc.storage.SaveBlocks(bc.blocks); err != nil {
-		log.Printf("블록 저장 실패: %v", err)
+		// 저장 실패 시 원래 체인으로 복구
+		bc.blocks = oldBlocks
+		log.Printf("체인 저장 실패로 교체 취소: %v", err)
+		return false
 	}
 
+	bc.transactionPool.Clear() // 체인 교체 시 트랜잭션 풀 비우기
+	log.Printf("체인 교체 성공: 새 체인 길이=%d", len(newBlocks))
 	return true
 }

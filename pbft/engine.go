@@ -1,6 +1,7 @@
 package pbft
 
 import (
+	"encoding/json"
 	"log"
 	"sync"
 
@@ -41,13 +42,16 @@ func (p *PBFT) UpdateNodeIDs(ids []string) {
 
 func NewPBFT(nodeID string, broadcast func(int, core.Block), addBlock func(core.Block) bool) *PBFT {
 	return &PBFT{
-		NodeID:     nodeID,
-		NodeIDs:    []string{nodeID},
-		BlockPool:  make(map[string]core.Block),
-		prepareCnt: make(map[string]int),
-		commitCnt:  make(map[string]int),
-		Broadcast:  broadcast,
-		AddBlock:   addBlock,
+		NodeID:             nodeID,
+		NodeIDs:            []string{nodeID},
+		BlockPool:          make(map[string]core.Block),
+		prepareCnt:         make(map[string]int),
+		commitCnt:          make(map[string]int),
+		Broadcast:          broadcast,
+		AddBlock:           addBlock,
+		preprepareReceived: make(map[string]bool),
+		pendingPrepares:    make(map[string][]message.Message),
+		pendingCommits:     make(map[string][]message.Message),
 	}
 }
 
@@ -57,44 +61,95 @@ type PBFTPayload struct {
 	Signature string     `json:"signature"` // 아직은 서명 없이 진행 가능
 }
 
-func (p *PBFT) OnPrepare(payload PBFTPayload) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	hash := payload.Block.Hash
-
-	if _, exists := p.BlockPool[hash]; !exists {
-		log.Println("[PBFT] 알 수 없는 블록 Prepare 무시")
-		return
-	}
-
-	p.prepareCnt[hash]++
-	log.Printf("[PBFT] Prepare 수신 (%d/%d)", p.prepareCnt[hash], 2)
-
-	// 예시: 2명 이상 Prepare 시 Commit 전송
-	if p.prepareCnt[hash] == 2 {
-		p.Broadcast(message.MessageTypePBFTCommit, payload.Block)
-	}
-}
-
 func (p *PBFT) OnPrePrepare(payload PBFTPayload) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	hash := payload.Block.Hash
+	log.Printf("[PBFT] PrePrepare 수신: 블록=%+v, 해시=%s", payload.Block, hash)
 
-	// 이미 본 블록이면 무시
 	if _, exists := p.BlockPool[hash]; exists {
+		log.Printf("[PBFT] 이미 처리된 블록 무시: %s", hash)
+		return
+	}
+
+	if !isValidBlock(payload.Block) {
+		log.Printf("[PBFT] 유효하지 않은 블록: %s", hash)
 		return
 	}
 
 	p.BlockPool[hash] = payload.Block
 	p.prepareCnt[hash] = 0
 	p.commitCnt[hash] = 0
+	p.preprepareReceived[hash] = true
+	log.Printf("[PBFT] 블록 저장 완료: %s, BlockPool=%+v", hash, p.BlockPool)
+	// 대기 중인 Prepare 메시지 처리
+	if prepares, exists := p.pendingPrepares[hash]; exists {
+		log.Printf("[PBFT] 처리할 대기 Prepare 메시지 수: %d", len(prepares))
+		for _, msg := range prepares {
+			var prepPayload PBFTPayload
+			if err := json.Unmarshal(msg.Data, &prepPayload); err == nil {
+				log.Printf("[PBFT] 대기 Prepare 처리: %s", prepPayload.Block.Hash)
+				p.processPrepare(prepPayload)
+			} else {
+				log.Printf("[PBFT] 대기 Prepare 파싱 실패: %v", err)
+			}
+		}
+		delete(p.pendingPrepares, hash)
+	}
 
-	log.Println("[PBFT] PrePrepare 수신, Prepare 브로드캐스트 시작")
+	// 대기 중인 Commit 메시지 처리
+	if commits, exists := p.pendingCommits[hash]; exists {
+		log.Printf("[PBFT] 대기 중인 Commit 메시지 처리 시작: %s", hash)
+		for _, msg := range commits {
+			var commitPayload PBFTPayload
+			if err := json.Unmarshal(msg.Data, &commitPayload); err == nil {
+				p.processCommit(commitPayload)
+			}
+		}
+		delete(p.pendingCommits, hash)
+	}
 
+	// Prepare 메시지 브로드캐스트
 	p.Broadcast(message.MessageTypePBFTPrepare, payload.Block)
+	log.Printf("[PBFT] Prepare 메시지 브로드캐스트 완료: %s", hash)
+}
+
+func (p *PBFT) OnPrepare(payload PBFTPayload) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	hash := payload.Block.Hash
+	log.Printf("[PBFT] Prepare 수신 시작: %s", hash)
+
+	if !p.preprepareReceived[hash] {
+		log.Printf("[PBFT] PrePrepare가 없는 Prepare 메시지 대기열에 추가: %s", hash)
+		p.pendingPrepares[hash] = append(p.pendingPrepares[hash], message.Message{
+			Type: message.MessageTypePBFTPrepare,
+			Data: mustMarshal(payload),
+		})
+		return
+	}
+
+	p.processPrepare(payload)
+}
+
+func (p *PBFT) processPrepare(payload PBFTPayload) {
+	hash := payload.Block.Hash
+	if _, exists := p.BlockPool[hash]; !exists {
+		log.Printf("[PBFT] 알 수 없는 블록 Prepare 무시: %s", hash)
+		return
+	}
+
+	p.prepareCnt[hash]++
+	f := (len(p.NodeIDs) - 1) / 3 // 결함 허용 노드 수
+	required := 2*f + 1
+	log.Printf("[PBFT] Prepare 처리: %d/%d, 해시=%s", p.prepareCnt[hash], required, hash)
+
+	if p.prepareCnt[hash] >= required {
+		log.Printf("[PBFT] 충분한 Prepare 수신, Commit 브로드캐스트: %s", hash)
+		p.Broadcast(message.MessageTypePBFTCommit, payload.Block)
+	}
 }
 
 func (p *PBFT) OnCommit(payload PBFTPayload) {
@@ -102,25 +157,71 @@ func (p *PBFT) OnCommit(payload PBFTPayload) {
 	defer p.mu.Unlock()
 
 	hash := payload.Block.Hash
+	log.Printf("[PBFT] Commit 수신 시작: %s", hash)
 
-	if _, exists := p.BlockPool[hash]; !exists {
-		log.Println("[PBFT] 알 수 없는 블록 Commit 무시")
+	if !p.preprepareReceived[hash] {
+		log.Printf("[PBFT] PrePrepare가 없는 Commit 메시지 대기열에 추가: %s", hash)
+		p.pendingCommits[hash] = append(p.pendingCommits[hash], message.Message{
+			Type: message.MessageTypePBFTCommit,
+			Data: mustMarshal(payload),
+		})
 		return
 	}
 
-	p.commitCnt[hash]++
-	log.Printf("[PBFT] Commit 수신 (%d/%d)", p.commitCnt[hash], 2)
+	p.processCommit(payload)
+}
 
-	if p.commitCnt[hash] == 2 {
+func (p *PBFT) processCommit(payload PBFTPayload) {
+	hash := payload.Block.Hash
+	p.commitCnt[hash]++
+
+	f := (len(p.NodeIDs) - 1) / 3
+	required := 2*f + 1
+
+	if p.commitCnt[hash] >= required {
+		log.Printf("[PBFT] 블록 최종 Commit 도달 → 체인에 추가 시도")
+
 		success := p.AddBlock(payload.Block)
 		if success {
-			log.Println("[PBFT] 블록 최종 확정 및 체인에 추가")
+			log.Printf("[PBFT] 블록 추가 성공: %s", payload.Block.Hash)
 		} else {
-			log.Println("[PBFT] 블록 추가 실패 (중복?)")
+			log.Printf("[PBFT] 블록 추가 실패: %s", payload.Block.Hash)
 		}
-		// 정리
-		delete(p.BlockPool, hash)
-		delete(p.prepareCnt, hash)
-		delete(p.commitCnt, hash)
+
+		p.cleanupBlock(hash)
 	}
+}
+
+func isValidBlock(block core.Block) bool {
+	log.Printf("[isValidBlock] 검증 중인 블록: %+v", block)
+	if block.Index < 0 {
+		log.Printf("[isValidBlock] 잘못된 인덱스: %d", block.Index)
+		return false
+	}
+	if block.Timestamp == "" {
+		log.Printf("[isValidBlock] 빈 타임스탬프")
+		return false
+	}
+	if block.Hash == "" {
+		log.Printf("[isValidBlock] 빈 해시")
+		return false
+	}
+	return true
+}
+
+func (p *PBFT) cleanupBlock(hash string) {
+	delete(p.BlockPool, hash)
+	delete(p.prepareCnt, hash)
+	delete(p.commitCnt, hash)
+	delete(p.preprepareReceived, hash)
+	delete(p.pendingPrepares, hash)
+	delete(p.pendingCommits, hash)
+}
+
+func mustMarshal(v interface{}) []byte {
+	bytes, err := json.Marshal(v)
+	if err != nil {
+		log.Fatalf("Marshal 실패: %v", err)
+	}
+	return bytes
 }

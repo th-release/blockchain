@@ -3,9 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"net"
-	"net/http"
 
 	"cth-core.xyz/blockchain/api"
 	"cth-core.xyz/blockchain/core"
@@ -45,14 +43,9 @@ func main() {
 
 	fmt.Printf("API 포트: %d | P2P 포트: %d | 호스트: %s\n", *apiPort, *p2pPort, host)
 	bc := core.NewBlockchain(host)
-	p2pserver := network.NewP2PServer(bc, *maxPeer)
+	p2pserver := network.NewP2PServer(bc, *maxPeer, fmt.Sprintf(":%d", *p2pPort))
 
 	server := api.NewServer(p2pserver, bc)
-
-	go func() {
-		http.HandleFunc("/ws", p2pserver.HandleConnections)
-		log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *p2pPort), nil))
-	}()
 
 	server.App.Listen(fmt.Sprintf(":%d", *apiPort))
 }
