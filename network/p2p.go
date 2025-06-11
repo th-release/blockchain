@@ -272,12 +272,38 @@ func (s *P2PServer) processMessage(conn *net.TCPConn, msg message.Message, remot
 		}
 		s.peersMutex.Unlock()
 
+		// 연결되지 않은 피어들에 대해 연결 시도
 		for _, addr := range peerAddresses {
-			if err := s.ConnectToPeer(addr); err != nil {
-				log.Printf("피어 연결 실패 (%s): %v", addr, err)
-			} else {
-				log.Printf("피어 연결 성공: %s", addr)
+			normalizedAddr := util.NormalizeAddr(addr)
+			s.peersMutex.Lock()
+			if _, ok := s.peers[normalizedAddr]; ok {
+				s.peersMutex.Unlock()
+				log.Printf("이미 연결된 피어, 연결 스킵: %s", normalizedAddr)
+				continue
 			}
+			if len(s.peers) >= s.maxPeer {
+				s.peersMutex.Unlock()
+				log.Printf("최대 피어 수 초과, 연결 스킵: %s", normalizedAddr)
+				continue
+			}
+			s.peersMutex.Unlock()
+
+			if err := s.ConnectToPeer(normalizedAddr); err != nil {
+				log.Printf("피어 연결 실패 (%s): %v", normalizedAddr, err)
+			} else {
+				log.Printf("피어 연결 성공: %s", normalizedAddr)
+			}
+		}
+
+		// 현재 연결된 모든 피어들에게 AddPeers 메시지 브로드캐스트
+		newMsg := message.Message{
+			Type: message.AddPeers,
+			Data: mustMarshal(peerAddresses),
+			ID:   uuid.New().String(),
+			TTL:  msg.TTL - 1, // TTL 감소
+		}
+		if newMsg.TTL > 0 {
+			s.Broadcast(newMsg)
 		}
 
 	case message.HEARTBEAT:
