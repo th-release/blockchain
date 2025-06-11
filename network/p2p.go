@@ -66,6 +66,8 @@ func (s *P2PServer) StartScheduler(interval float64) {
 					block := s.bc.MineBlock()
 					if block.Index != 0 { // Check if a valid block was mined
 						log.Printf("Scheduler successfully mined block: Index=%d, Hash=%s", block.Index, block.Hash)
+						// 새 블록 브로드캐스트
+						s.BroadcastNewBlock(block)
 					}
 				}
 
