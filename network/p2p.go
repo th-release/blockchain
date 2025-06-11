@@ -48,11 +48,6 @@ func (s *P2PServer) StartScheduler(interval float64) {
 		for range ticker.C {
 			if s.pbftEngine.IsLeader() {
 				if len(s.bc.GetTransactionPool().GetTransactions()) > 0 {
-					s.pbftEngine.View += 1
-					if len(s.peers)+1 < s.pbftEngine.View {
-						s.pbftEngine.View = 1
-					}
-
 					msg := message.Message{
 						Type: message.SyncView,
 						Data: mustMarshal(s.pbftEngine.View),
@@ -67,7 +62,13 @@ func (s *P2PServer) StartScheduler(interval float64) {
 					if block.Index != 0 { // Check if a valid block was mined
 						log.Printf("Scheduler successfully mined block: Index=%d, Hash=%s", block.Index, block.Hash)
 						// 새 블록 브로드캐스트
+						fmt.Println("블록 마이닝 전파!!!!")
 						s.BroadcastNewBlock(block)
+
+						s.pbftEngine.View += 1
+						if len(s.peers)+1 < s.pbftEngine.View {
+							s.pbftEngine.View = 1
+						}
 					}
 				}
 
