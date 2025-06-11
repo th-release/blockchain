@@ -105,7 +105,6 @@ func (s *P2PServer) acceptConnections() {
 			log.Printf("TCP 연결 수락 실패: %v", err)
 			continue
 		}
-
 		remoteAddr := util.NormalizeAddr(conn.RemoteAddr().String())
 		s.peersMutex.Lock()
 		if len(s.peers) >= s.maxPeer {
@@ -114,10 +113,9 @@ func (s *P2PServer) acceptConnections() {
 			log.Printf("최대 피어 수 초과로 연결 거부: %s", remoteAddr)
 			continue
 		}
-		s.peers[remoteAddr] = conn
 		s.peersMutex.Unlock()
 
-		log.Printf("새 피어 연결됨: %s", remoteAddr)
+		log.Printf("새 피어 연결됨: %s (임시 주소)", remoteAddr)
 		go s.handleMessages(conn)
 		s.sendMessage(conn, message.Message{Type: message.QUERY_LATEST, ID: uuid.New().String(), TTL: 10})
 		s.sendMessage(conn, message.Message{Type: message.AddNodeId, Data: mustMarshal(s.nodeID), ID: uuid.New().String(), TTL: 10})
@@ -180,11 +178,11 @@ func (s *P2PServer) handleMessages(conn *net.TCPConn) {
 			continue
 		}
 
-		s.processMessage(conn, msg)
+		s.processMessage(conn, msg, remoteAddr) // remoteAddr 추가
 	}
 }
 
-func (s *P2PServer) processMessage(conn *net.TCPConn, msg message.Message) {
+func (s *P2PServer) processMessage(conn *net.TCPConn, msg message.Message, remoteAddr string) {
 	s.seenMessagesMutex.Lock()
 	if s.seenMessages[msg.ID] {
 		s.seenMessagesMutex.Unlock()
@@ -258,6 +256,22 @@ func (s *P2PServer) processMessage(conn *net.TCPConn, msg message.Message) {
 			return
 		}
 		log.Println("상대방 Peers:", peerAddresses)
+
+		// 피어 주소로 peers 맵 갱신
+		s.peersMutex.Lock()
+		if _, ok := s.peers[remoteAddr]; ok {
+			for _, addr := range peerAddresses {
+				if addr == remoteAddr {
+					// remoteAddr를 새로운 주소로 교체
+					delete(s.peers, remoteAddr)
+					s.peers[util.NormalizeAddr(addr)] = conn
+					log.Printf("피어 주소 갱신: %s -> %s", remoteAddr, addr)
+					break
+				}
+			}
+		}
+		s.peersMutex.Unlock()
+
 		for _, addr := range peerAddresses {
 			if err := s.ConnectToPeer(addr); err != nil {
 				log.Printf("피어 연결 실패 (%s): %v", addr, err)
@@ -268,10 +282,9 @@ func (s *P2PServer) processMessage(conn *net.TCPConn, msg message.Message) {
 
 	case message.HEARTBEAT:
 		log.Printf("하트비트 수신: %s", msg.ID)
-		return // 하트비트는 재전파하지 않음
+		return
 	}
 
-	// Gossip 프로토콜로 메시지 재전파 (하트비트 제외)
 	if msg.TTL > 1 {
 		s.Broadcast(msg)
 	}
@@ -410,6 +423,7 @@ func (s *P2PServer) ConnectToPeer(address string) error {
 		return fmt.Errorf("TCP connect failed: %v", err)
 	}
 
+	// 서버 주소(normalizedAddr)를 peers 맵의 키로 사용
 	s.peersMutex.Lock()
 	s.peers[normalizedAddr] = conn
 	s.peersMutex.Unlock()
