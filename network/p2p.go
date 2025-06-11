@@ -40,6 +40,40 @@ func (s *P2PServer) Info() *pbft.PBFT {
 	return s.pbftEngine
 }
 
+// StartScheduler starts a scheduler that processes transactions from the transaction pool
+// and mines a new block every interval seconds.
+func (s *P2PServer) StartScheduler(interval float64) {
+	ticker := time.NewTicker(time.Duration(interval * float64(time.Second)))
+	go func() {
+		for range ticker.C {
+			if s.pbftEngine.IsLeader() {
+				if len(s.bc.GetTransactionPool().GetTransactions()) > 0 {
+					s.pbftEngine.View += 1
+					if len(s.peers)+1 < s.pbftEngine.View {
+						s.pbftEngine.View = 1
+					}
+
+					msg := message.Message{
+						Type: message.SyncView,
+						Data: mustMarshal(s.pbftEngine.View),
+						ID:   uuid.New().String(),
+						TTL:  10, // 기본 TTL
+					}
+
+					s.Broadcast(msg)
+
+					log.Println("Scheduler triggered: Attempting to mine a new block")
+					block := s.bc.MineBlock()
+					if block.Index != 0 { // Check if a valid block was mined
+						log.Printf("Scheduler successfully mined block: Index=%d, Hash=%s", block.Index, block.Hash)
+					}
+				}
+
+			}
+		}
+	}()
+}
+
 func NewP2PServer(bc *core.Blockchain, maxPeer int, listenAddr string) *P2PServer {
 	nodeID, err := uuid.NewUUID()
 	if err != nil {
@@ -70,6 +104,7 @@ func NewP2PServer(bc *core.Blockchain, maxPeer int, listenAddr string) *P2PServe
 	}
 	s.listener = listener
 
+	s.StartScheduler(1)
 	go s.acceptConnections()
 	go s.sendHeartbeat() // 하트비트 주기적 전송
 
@@ -118,22 +153,14 @@ func (s *P2PServer) acceptConnections() {
 		log.Printf("새 피어 연결됨: %s (임시 주소)", remoteAddr)
 		go s.handleMessages(conn)
 		s.sendMessage(conn, message.Message{Type: message.QUERY_LATEST, ID: uuid.New().String(), TTL: 10})
-		s.sendMessage(conn, message.Message{Type: message.AddNodeId, Data: mustMarshal(s.nodeID), ID: uuid.New().String(), TTL: 10})
+		s.sendMessage(conn, message.Message{Type: message.AddNodes, Data: mustMarshal(s.nodeIDs), ID: uuid.New().String(), TTL: 10})
 		s.sendMessage(conn, message.Message{Type: message.AddPeers, Data: mustMarshal(s.GetPeers()), ID: uuid.New().String(), TTL: 10})
 	}
 }
 
-func (s *P2PServer) AddNodeId(id string) {
-	for _, existing := range s.nodeIDs {
-		if existing == id {
-			return
-		}
-	}
-	s.nodeIDs = append(s.nodeIDs, id)
-	log.Println("노드 ID 등록됨:", id)
-
+func (s *P2PServer) AddNodes(ids []string) {
 	if s.pbftEngine != nil {
-		s.pbftEngine.UpdateNodeIDs(s.nodeIDs)
+		s.pbftEngine.UpdateNodeIDs(ids)
 	}
 }
 
@@ -144,6 +171,7 @@ func (s *P2PServer) onClose(conn *net.TCPConn, remoteAddr string, closeErr error
 	s.peersMutex.Unlock()
 
 	log.Printf("피어 연결 종료: %s, 에러: %v", normalizedAddr, closeErr)
+	delete(s.peers, normalizedAddr)
 	conn.Close()
 
 	if closeErr != nil && !strings.Contains(closeErr.Error(), "use of closed network connection") {
@@ -186,7 +214,7 @@ func (s *P2PServer) processMessage(conn *net.TCPConn, msg message.Message, remot
 	s.seenMessagesMutex.Lock()
 	if s.seenMessages[msg.ID] {
 		s.seenMessagesMutex.Unlock()
-		log.Printf("중복 메시지 무시: %s", msg.ID)
+		log.Printf("중복 메시지 무시: %s", msg.Data)
 		return
 	}
 	s.seenMessages[msg.ID] = true
@@ -242,11 +270,11 @@ func (s *P2PServer) processMessage(conn *net.TCPConn, msg message.Message, remot
 		}
 		s.pbftEngine.OnCommit(pbft)
 
-	case message.AddNodeId:
-		var peerID string
-		if err := json.Unmarshal(msg.Data, &peerID); err == nil {
-			log.Println("상대방 NodeID:", peerID)
-			s.AddNodeId(peerID)
+	case message.AddNodes:
+		var nodeIDs []string
+		if err := json.Unmarshal(msg.Data, &nodeIDs); err == nil {
+			log.Println("AddNodes:", nodeIDs)
+			s.AddNodes(nodeIDs)
 		}
 
 	case message.AddPeers:
@@ -272,39 +300,22 @@ func (s *P2PServer) processMessage(conn *net.TCPConn, msg message.Message, remot
 		}
 		s.peersMutex.Unlock()
 
-		// 연결되지 않은 피어들에 대해 연결 시도
 		for _, addr := range peerAddresses {
-			normalizedAddr := util.NormalizeAddr(addr)
-			s.peersMutex.Lock()
-			if _, ok := s.peers[normalizedAddr]; ok {
-				s.peersMutex.Unlock()
-				log.Printf("이미 연결된 피어, 연결 스킵: %s", normalizedAddr)
-				continue
-			}
-			if len(s.peers) >= s.maxPeer {
-				s.peersMutex.Unlock()
-				log.Printf("최대 피어 수 초과, 연결 스킵: %s", normalizedAddr)
-				continue
-			}
-			s.peersMutex.Unlock()
-
-			if err := s.ConnectToPeer(normalizedAddr); err != nil {
-				log.Printf("피어 연결 실패 (%s): %v", normalizedAddr, err)
+			if err := s.ConnectToPeer(addr); err != nil {
+				log.Printf("피어 연결 실패 (%s): %v", addr, err)
 			} else {
-				log.Printf("피어 연결 성공: %s", normalizedAddr)
+				log.Printf("피어 연결 성공: %s", addr)
 			}
 		}
-
-		// 현재 연결된 모든 피어들에게 AddPeers 메시지 브로드캐스트
-		newMsg := message.Message{
-			Type: message.AddPeers,
-			Data: mustMarshal(peerAddresses),
-			ID:   uuid.New().String(),
-			TTL:  msg.TTL - 1, // TTL 감소
+		// s.Broadcast(message.Message{Type: message.AddPeers, Data: mustMarshal(s.GetPeers()), ID: uuid.New().String(), TTL: 10})
+	case message.SyncView:
+		var view int
+		if err := json.Unmarshal(msg.Data, &view); err != nil {
+			log.Println("view 정보 역직렬화 실패:", err)
+			return
 		}
-		if newMsg.TTL > 0 {
-			s.Broadcast(newMsg)
-		}
+		log.Println("상대방 view:", view)
+		s.SyncView(view)
 
 	case message.HEARTBEAT:
 		log.Printf("하트비트 수신: %s", msg.ID)
@@ -314,6 +325,10 @@ func (s *P2PServer) processMessage(conn *net.TCPConn, msg message.Message, remot
 	if msg.TTL > 1 {
 		s.Broadcast(msg)
 	}
+}
+
+func (s *P2PServer) SyncView(view int) {
+	s.pbftEngine.View = view
 }
 
 func (s *P2PServer) handleBlockchainResponse(data json.RawMessage) {
@@ -457,7 +472,7 @@ func (s *P2PServer) ConnectToPeer(address string) error {
 	log.Printf("새 피어 연결 성공: %s", normalizedAddr)
 	go s.handleMessages(conn)
 	s.sendMessage(conn, message.Message{Type: message.QUERY_LATEST, ID: uuid.New().String(), TTL: 10})
-	s.sendMessage(conn, message.Message{Type: message.AddNodeId, Data: mustMarshal(s.nodeID), ID: uuid.New().String(), TTL: 10})
+	s.sendMessage(conn, message.Message{Type: message.AddNodes, Data: mustMarshal(s.nodeIDs), ID: uuid.New().String(), TTL: 10})
 	s.sendMessage(conn, message.Message{Type: message.AddPeers, Data: mustMarshal(s.GetPeers()), ID: uuid.New().String(), TTL: 10})
 
 	return nil
@@ -489,6 +504,7 @@ func (s *P2PServer) tryReconnect(address string) {
 	defer func() {
 		s.peersMutex.Lock()
 		delete(s.reconnecting, normalizedAddr)
+		delete(s.peers, address)
 		s.peersMutex.Unlock()
 		log.Printf("재접속 시도 종료: %s", normalizedAddr)
 	}()
@@ -515,6 +531,7 @@ func (s *P2PServer) tryReconnect(address string) {
 		time.Sleep(backoff)
 	}
 	log.Printf("재접속 최대 시도 횟수 초과, 종료: %s", normalizedAddr)
+	delete(s.peers, address)
 }
 
 func (s *P2PServer) BroadcastTransaction(tx core.Transaction) {

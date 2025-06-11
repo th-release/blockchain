@@ -10,8 +10,9 @@ const (
 	MessageTypePBFTPrePrepare = 4
 	MessageTypePBFTPrepare    = 5
 	MessageTypePBFTCommit     = 6
-	AddNodeId                 = 100
+	AddNodes                  = 100
 	AddPeers                  = 101
+	SyncView                  = 102
 	HEARTBEAT                 = 1000 // 하트비트 메시지
 )
 

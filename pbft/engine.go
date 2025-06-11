@@ -37,7 +37,23 @@ func (p *PBFT) IsLeader() bool {
 func (p *PBFT) UpdateNodeIDs(ids []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.NodeIDs = ids
+
+	// 기존 NodeIDs를 맵으로 변환하여 검색 효율성 향상
+	existingIDs := make(map[string]struct{}, len(p.NodeIDs))
+	for _, id := range p.NodeIDs {
+		existingIDs[id] = struct{}{}
+	}
+
+	// 새로운 ID만 추가
+	var newNodeIDs []string
+	newNodeIDs = append(newNodeIDs, p.NodeIDs...) // 기존 ID 복사
+	for _, id := range ids {
+		if _, exists := existingIDs[id]; !exists {
+			newNodeIDs = append(newNodeIDs, id)
+		}
+	}
+
+	p.NodeIDs = newNodeIDs
 }
 
 func NewPBFT(nodeID string, broadcast func(int, core.Block), addBlock func(core.Block) bool) *PBFT {

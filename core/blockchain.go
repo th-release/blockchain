@@ -13,6 +13,10 @@ type Blockchain struct {
 	storage         *Storage
 }
 
+func (bc *Blockchain) GetTransactionPool() *TransactionPool {
+	return bc.transactionPool
+}
+
 // NewBlockchain은 제네시스 블록이 포함된 새 체인을 생성합니다.
 func NewBlockchain(host string) *Blockchain {
 	storage, err := NewStorage("data", host)
