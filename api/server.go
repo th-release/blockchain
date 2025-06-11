@@ -29,7 +29,6 @@ func NewServer(p2pServer *network.P2PServer, bc *core.Blockchain) *Server {
 func (s *Server) setupRoutes() {
 	s.App.Get("/blocks", s.getBlocks)
 	s.App.Post("/transaction", s.handleCreateTransaction)
-	s.App.Post("/mine", s.mineBlock)
 	s.App.Get("/validate", s.validateChain)
 	s.App.Get("/peers", s.handleGetPeers)
 	s.App.Post("/addPeer", s.handleAddPeer)
@@ -67,18 +66,6 @@ type AddBlockRequest struct {
 
 type AddTransactionRequest struct {
 	Payload string `json:"payload"`
-}
-
-func (s *Server) mineBlock(c *fiber.Ctx) error {
-	block := s.Blockchain.MineBlock()
-	if block.Index == 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "트랜잭션이 없습니다"})
-	}
-
-	// 새 블록 브로드캐스트
-	s.P2PServer.BroadcastNewBlock(block)
-
-	return c.Status(fiber.StatusCreated).JSON(block)
 }
 
 func (s *Server) validateChain(c *fiber.Ctx) error {
