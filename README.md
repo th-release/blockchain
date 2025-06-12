@@ -29,7 +29,9 @@ After sending a transaction, the network conducts a block mining vote for the tr
 
 ## TODO:
 0. CLI 구성 ~~ Ing ...
-1. 블록체인 구성 [블록, 트랜잭션, 체인] Check!
+1. 블록체인 구성 [블록, 트랜잭션, 체인] Ing ...
+    * 유저 개념 추가
+    * Transaction 서명 개발
 2. p2p 구성 [~~Socket~~ -> TCP] Check!
 3. 데이터 저장방식 구성 [~~Memory~~ -> ~~Json~~ -> LevelDB] Check!
 4. 합의 알고리즘 구성 [PBFT] Check!
